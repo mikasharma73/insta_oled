@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
-import { resolve } from "node:path";
+import { stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import type { BrowserContext } from "playwright";
 import { Api, LoginRequired } from "./src/api.ts";
+import { Bunny } from "./src/bunny.ts";
 import { DOWNLOAD_ROOT } from "./src/config.ts";
 import { Downloader } from "./src/download.ts";
 import { close, isLoggedIn, launch } from "./src/session.ts";
@@ -13,6 +15,8 @@ insta <command>
   login                  Open a browser, sign in to Instagram, session is saved
   info <username>        Show profile summary (counts, privacy) without downloading
   download <username>    Download everything: posts, reels, carousels, stories
+  upload <username>      Upload downloads/<username>/ to a Bunny storage zone
+  auto <username>        Download then upload in one run
     --out <dir>          Output root (default ./downloads)
     --max <n>            Stop after n posts (useful for a first test)
     --stories            Also download stories (skipped by default)
@@ -20,11 +24,41 @@ insta <command>
     --headed             Show the browser window while downloading
     --json               Print the profile summary as JSON
 
+  upload options
+    --storage-zone <id>  Bunny storage zone (or BUNNY_STORAGE_ZONE)
+    --path <prefix>      Key prefix inside the zone, default "main"
+    --no-prefix          Put files at the zone root, no prefix
+    --only <subfolder>   Upload just one of photos/reels/carousels/stories
+    --media-only         Skip the .txt and .json sidecars
+    --concurrency <n>    Parallel uploads, default 4
+    --dry-run            List what would be uploaded, send nothing
+    --out <dir>          Where downloads/<username> lives, default ./downloads
+
 Examples
   bun run index.ts login
   bun run index.ts info someuser
   bun run index.ts download someuser --out ./downloads
+
+export BUNNY_STORAGE_PASSWORD=...   # required by upload, never passed as a flag
+bun run index.ts upload someuser --storage-zone 123456 --dry-run
+bun run index.ts upload someuser --storage-zone 123456
+bun run index.ts auto someuser --storage-zone 123456          # download then upload
 `;
+
+interface UploadOpts {
+  zone: string;
+  password: string;
+  prefix: string;
+  only?: string;
+  mediaOnly: boolean;
+  dryRun: boolean;
+  concurrency: number;
+  out: string;
+}
+
+function mb(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
 
 function arg(flag: string): string | undefined {
   const i = process.argv.indexOf(flag);
@@ -178,6 +212,97 @@ async function resolveItem(api: Api, item: Item): Promise<Item> {
   }
 }
 
+async function cmdUpload(username: string, opts: UploadOpts): Promise<void> {
+  const root = join(resolve(opts.out), username);
+
+  try {
+    await stat(root);
+  } catch {
+    throw new Error(
+      `No local folder at ${root}. Run "bun run index.ts download ${username}" first.`,
+    );
+  }
+
+  const bunny = new Bunny({
+    zone: opts.zone,
+    password: opts.password,
+    pathPrefix: opts.prefix,
+    only: opts.only,
+    mediaOnly: opts.mediaOnly,
+    dryRun: opts.dryRun,
+    concurrency: opts.concurrency,
+  });
+
+  const entries = await bunny.collect(root, username);
+  const totalBytes = entries.reduce((sum, e) => sum + e.size, 0);
+
+  const target = [opts.prefix, username].filter(Boolean).join("/");
+  console.log(`Source   ${root}`);
+  console.log(`Zone     ${opts.zone}`);
+  console.log(`Prefix   ${opts.prefix ? `${opts.prefix}/` : "(none)"}`);
+  console.log(`Files    ${entries.length}  (${mb(totalBytes)})`);
+  if (opts.only) console.log(`Filter   only ${opts.only}/${opts.mediaOnly ? "media only" : "all files"}`);
+  console.log(`Target   ${target}/...\n`);
+
+  if (!entries.length) {
+    console.log("Nothing to upload.");
+    return;
+  }
+
+  const started = Date.now();
+  const result = await bunny.upload(entries);
+  const secs = ((Date.now() - started) / 1000).toFixed(0);
+
+  console.log(
+    `\n${opts.dryRun ? "Dry run finished" : "Upload finished"} in ${secs}s\n` +
+      `  uploaded ${result.uploaded}  skipped ${result.skipped}  failed ${result.failed}\n`,
+  );
+
+  if (result.failed > 0) process.exitCode = 1;
+}
+
+/** Reads the Bunny settings from flags and env, shared by `upload` and `auto`. */
+function uploadOptsFromArgs(out: string): UploadOpts {
+  const dryRun = has("--dry-run");
+  const password = Bun.env.BUNNY_STORAGE_PASSWORD ?? "";
+  const zone = arg("--storage-zone") ?? Bun.env.BUNNY_STORAGE_ZONE ?? "";
+
+  if (!password && !dryRun) {
+    throw new Error("Set BUNNY_STORAGE_PASSWORD in your environment before running upload.");
+  }
+  if (!zone) {
+    throw new Error("Pass --storage-zone <id> or set BUNNY_STORAGE_ZONE.");
+  }
+
+  return {
+    zone,
+    password,
+    prefix: has("--no-prefix") ? "" : (arg("--path") ?? "main"),
+    only: arg("--only"),
+    mediaOnly: has("--media-only"),
+    dryRun,
+    concurrency: Number(arg("--concurrency") ?? 4),
+    out,
+  };
+}
+
+/** download, then upload, in one run. */
+async function cmdAuto(
+  ctx: BrowserContext,
+  username: string,
+  out: string,
+  download: { max: number; stories: boolean; posts: boolean },
+): Promise<void> {
+  // Resolve Bunny settings first so a missing password fails immediately
+  // rather than after a long download.
+  const upload = uploadOptsFromArgs(out);
+
+  await cmdDownload(ctx, username, { ...download, out });
+
+  console.log("\n" + "=".repeat(60) + "\n");
+  await cmdUpload(username, upload);
+}
+
 async function main(): Promise<void> {
   const [command, arg1] = process.argv.slice(2).filter((a) => !a.startsWith("--"));
 
@@ -200,7 +325,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command !== "info" && command !== "download") {
+  if (command !== "info" && command !== "download" && command !== "upload" && command !== "auto") {
     console.error(`Unknown command: ${command}\n${HELP}`);
     process.exitCode = 1;
     return;
@@ -212,6 +337,18 @@ async function main(): Promise<void> {
   }
 
   const username = arg1.replace(/^@/, "");
+
+  // Upload needs no Instagram session, only the local folder and Bunny creds.
+  if (command === "upload") {
+    const out = arg("--out") ?? DOWNLOAD_ROOT;
+    try {
+      await cmdUpload(username, uploadOptsFromArgs(out));
+    } catch (err) {
+      console.error(`\nError: ${(err as Error).message}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
 
   const ctx = await ensureSession({
     headed: has("--headed"),
@@ -233,11 +370,22 @@ async function main(): Promise<void> {
       return;
     }
 
-    await cmdDownload(ctx, username, {
+    const downloadOpts = {
       out: arg("--out") ?? DOWNLOAD_ROOT,
       max: Number(arg("--max") ?? 0),
       stories: has("--stories"),
       posts: !has("--no-posts"),
+    };
+
+    if (command === "download") {
+      await cmdDownload(ctx, username, downloadOpts);
+      return;
+    }
+
+    await cmdAuto(ctx, username, downloadOpts.out, {
+      max: downloadOpts.max,
+      stories: downloadOpts.stories,
+      posts: downloadOpts.posts,
     });
   } catch (err) {
     if (err instanceof LoginRequired) console.error(`\n${err.message}\n`);
